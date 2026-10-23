@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 
 
 install(PROGRAMS
+    scripts/navigator.py
     scripts/heading_controller.py
     scripts/p3_plot.py
     DESTINATION lib/${PROJECT_NAME}
