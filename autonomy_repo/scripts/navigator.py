@@ -7,7 +7,7 @@ from scipy.interpolate import splev, splrep
 from asl_tb3_lib.math_utils import wrap_angle
 from asl_tb3_lib.navigation import BaseNavigator, TrajectoryPlan
 from asl_tb3_msgs.msg import TurtleBotControl, TurtleBotState
-
+from std_msgs.msg import Bool
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 #from utils import plot_line_segments
@@ -52,7 +52,7 @@ class AStar(object):
         for i in range(len(x)):
             if x[i] < self.statespace_lo[i] or x[i] > self.statespace_hi[i]:
                 return False
-        return self.occupancy.is_free(x)
+        return self.occupancy.is_free(np.asarray(x, dtype=float))
         #raise NotImplementedError("is_free not implemented")
         ########## Code ends here ##########
 
@@ -271,14 +271,31 @@ class Navigator(BaseNavigator):
         self.v_desired = 0.15
         self.spline_alpha = 0.005
         self.reset_tracking_history()
+        self.stop_until = 0.0
+        self.stop_cooldown_until = 0.0
+        self.create_subscription(Bool, "/detector_bool", self.detector_callback, 10)
 
     def reset_tracking_history(self):
         self.V_prev = 0.0
         self.om_prev = 0.0
         self.t_prev = 0.0
 
+    def now_sec(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def is_stopped(self):
+        return self.now_sec() < self.stop_until
+
+    def detector_callback(self, msg: Bool):
+        now = self.now_sec()
+        if msg.data and now > self.stop_cooldown_until:
+            self.stop_until = now + 5.0
+            self.stop_cooldown_until = now + 5.0 + 8.0   # ignore the same sign after resuming
+            self.get_logger().info("Stop sign detected: pausing for 5 s.")
     def compute_heading_control(self, state: TurtleBotState,
                                 goal: TurtleBotState) -> TurtleBotControl:
+        if self.is_stopped():
+            return TurtleBotControl()
         control = TurtleBotControl()
         control.omega = float(self.kp * wrap_angle(goal.theta - state.theta))
         return control
@@ -289,6 +306,11 @@ class Navigator(BaseNavigator):
         # The base class supplies elapsed plan time and manages mode transitions.
         # Clamp only the spline evaluation time, never extrapolate past its domain.
         t_eval = float(np.clip(t, 0.0, plan.duration))
+        if self.is_stopped():
+            self.V_prev = 0.0
+            self.om_prev = 0.0
+            self.t_prev = float(t)   # keeps dt small when we resume
+            return TurtleBotControl()
         if t < self.t_prev:
             self.reset_tracking_history()
         dt = max(0.0, float(t) - self.t_prev)

@@ -14,6 +14,7 @@ install(PROGRAMS
     scripts/perception_controller.py
     scripts/heading_controller.py
     scripts/p3_plot.py
+    scripts/frontier_explorer.py
     DESTINATION lib/${PROJECT_NAME}
 )
 
