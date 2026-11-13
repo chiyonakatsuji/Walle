@@ -30,11 +30,10 @@ def generate_launch_description():
             ),
             # relay RVIZ goal pose to some other channel
             Node(
-                executable="rviz_goal_relay.py",
-                package="asl_tb3_lib",
-                parameters=[
-                    {"output_channel": "/cmd_nav"},
-                ],
+                executable="navigator.py",
+                package=PACKAGE,
+                output="screen",
+                parameters=[{"use_sim_time": use_sim_time}],
             ),
             # state publisher for turtlebot
             Node(
