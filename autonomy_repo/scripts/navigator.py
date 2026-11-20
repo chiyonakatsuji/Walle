@@ -15,11 +15,19 @@ import matplotlib.patches as patches
 class AStar(object):
     """Represents a motion planning problem to be solved using A*"""
 
-    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1):
+    def __init__(self, statespace_lo, statespace_hi, x_init, x_goal, occupancy, resolution=1,
+                 start_radius=0.0, goal_radius=0.0):
         self.statespace_lo = statespace_lo         # state space lower bound (e.g., [-5, -5])
         self.statespace_hi = statespace_hi         # state space upper bound (e.g., [5, 5])
         self.occupancy = occupancy                 # occupancy grid (a DetOccupancyGrid2D object)
         self.resolution = resolution               # resolution of the discretization of state space (cell/m)
+        # Cells within these radii of the start / goal count as free even if the
+        # inflated map says otherwise, so the robot can plan when it is close to an
+        # obstacle (set to 0.0 to disable).
+        self.start_radius = start_radius
+        self.goal_radius = goal_radius
+        self.start_xy = np.array(x_init, dtype=float)
+        self.goal_xy = np.array(x_goal, dtype=float)
         self.x_offset = x_init                     
         self.x_init = self.snap_to_grid(x_init)    # initial state
         self.x_goal = self.snap_to_grid(x_goal)    # goal state
@@ -52,7 +60,13 @@ class AStar(object):
         for i in range(len(x)):
             if x[i] < self.statespace_lo[i] or x[i] > self.statespace_hi[i]:
                 return False
-        return self.occupancy.is_free(np.asarray(x, dtype=float))
+        xa = np.asarray(x, dtype=float)
+        # Let the planner leave a cluttered start and reach a goal next to a wall.
+        if self.start_radius > 0 and np.linalg.norm(xa - self.start_xy) <= self.start_radius:
+            return True
+        if self.goal_radius > 0 and np.linalg.norm(xa - self.goal_xy) <= self.goal_radius:
+            return True
+        return self.occupancy.is_free(xa)
         #raise NotImplementedError("is_free not implemented")
         ########## Code ends here ##########
 
@@ -270,6 +284,10 @@ class Navigator(BaseNavigator):
         self.V_PREV_THRESH = 1e-4
         self.v_desired = 0.15
         self.spline_alpha = 0.005
+        # [m] Treat cells this close to the start / goal as free when planning, so the
+        # robot can plan while close to an obstacle. Set both to 0.0 to disable.
+        self.start_clear_radius = 0.2
+        self.goal_clear_radius = 0.15
         self.reset_tracking_history()
         self.stop_until = 0.0
         self.stop_cooldown_until = 0.0
@@ -292,6 +310,7 @@ class Navigator(BaseNavigator):
             self.stop_until = now + 5.0
             self.stop_cooldown_until = now + 5.0 + 8.0   # ignore the same sign after resuming
             self.get_logger().info("Stop sign detected: pausing for 5 s.")
+
     def compute_heading_control(self, state: TurtleBotState,
                                 goal: TurtleBotState) -> TurtleBotControl:
         if self.is_stopped():
@@ -348,12 +367,48 @@ class Navigator(BaseNavigator):
             lower = np.maximum(lower, occupancy.origin_xy)
             upper = np.minimum(upper, occupancy.origin_xy
                                + (occupancy.size_xy - 1) * occupancy.resolution)
+
+        # ---- Diagnostic: why might planning fail? (safe to delete later) ----
+        try:
+            n_free = sum(
+                bool(occupancy.is_free(start + np.array([dx, dy]) * resolution))
+                for dx in (-1, 0, 1) for dy in (-1, 0, 1) if (dx, dy) != (0, 0)
+            )
+            self.get_logger().info(
+                f"plan: dist={np.linalg.norm(target - start):.2f} horizon={horizon} res={resolution} "
+                f"win={getattr(occupancy, 'window_size', None)} "
+                f"start_free={occupancy.is_free(start)} free_nbrs={n_free}/8 "
+                f"target_free={occupancy.is_free(target)} "
+                f"in_box={bool(np.all(target >= lower) and np.all(target <= upper))}"
+            )
+        except Exception as e:
+            self.get_logger().warn(f"plan diagnostic failed: {e}")
+
         planner = AStar(tuple(lower), tuple(upper), tuple(start), tuple(target),
-                        occupancy, resolution=resolution)
-        if not planner.solve() or len(planner.path) < 4:
+                        occupancy, resolution=resolution,
+                        start_radius=self.start_clear_radius,
+                        goal_radius=self.goal_clear_radius)
+        if not planner.solve():
+            self.get_logger().warn("A* found no path.")
             return None
+        path = planner.path
+        # A cubic spline needs at least 4 points. A goal that is very close gives a
+        # shorter A* path, which used to be reported as a planning failure. Densify
+        # it instead so the robot can still drive there.
+        if len(path) < 4:
+            pts = np.array(path, dtype=float)
+            seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+            total = float(seg.sum())
+            if total < 1e-6:
+                self.get_logger().info("Already at the goal; nothing to plan.")
+                return None
+            s = np.concatenate(([0.0], np.cumsum(seg)))
+            s_new = np.linspace(0.0, total, 5)
+            path = list(zip(np.interp(s_new, s, pts[:, 0]),
+                            np.interp(s_new, s, pts[:, 1])))
+            self.get_logger().info(f"Short path ({len(pts)} pts) densified to {len(path)} pts.")
         self.reset_tracking_history()
-        return compute_smooth_plan(planner.path, self.v_desired, self.spline_alpha)
+        return compute_smooth_plan(path, self.v_desired, self.spline_alpha)
 
 
 def main():

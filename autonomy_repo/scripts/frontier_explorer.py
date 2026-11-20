@@ -8,14 +8,9 @@ Data flow:
   /nav_success (std_msgs/Bool)       --> nav_success_callback --> choose next frontier
   /detector_bool (std_msgs/Bool)     --> detector_callback    --> stop sign pause
   /cmd_nav (asl_tb3_msgs/TurtleBotState) <-- goal for the navigator
-  /cmd_vel (geometry_msgs/Twist)     <-- zero velocity while paused
 
-Exploration loop:
-  1. Wait until we have both a map and a robot pose, then send the first goal.
-  2. When the navigator reports success, pick the next-closest frontier.
-  3. When the navigator reports failure, blacklist that goal and try another.
-  4. When no frontiers remain, log that exploration is finished and stop.
-  5. When a stop sign is detected, stop for 5 s, then resume the saved goal.
+The navigator itself holds still for 5 s on a stop sign (it also listens to
+/detector_bool). The explorer just pauses its own decision making meanwhile.
 """
 
 import numpy as np
@@ -24,10 +19,10 @@ from rclpy.node import Node
 from scipy.signal import convolve2d
 
 from std_msgs.msg import Bool
-from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from asl_tb3_msgs.msg import TurtleBotState
 from asl_tb3_lib.grids import StochOccupancyGrid2D   # VERIFY: same import as the base navigator
+
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -42,6 +37,8 @@ class FrontierExplorer(Node):
         self.declare_parameter("min_goal_dist", 0.15)        # [m] skip frontiers we are already at
         self.declare_parameter("stop_duration", 5.0)         # [s] how long to stop at a stop sign
         self.declare_parameter("stop_cooldown", 8.0)         # [s] ignore the detector after resuming
+        self.declare_parameter("retry_delay", 1.0)           # [s] wait after a failed plan before the next goal
+        self.declare_parameter("max_blacklist_clears", 3)    # give up after clearing the blacklist this many times
 
         # ---------------- State ----------------
         self.occupancy = None
@@ -50,17 +47,17 @@ class FrontierExplorer(Node):
         self.finished = False
         self.failed_goals = []      # list of np.array([x, y]) that the planner could not reach
         self.current_goal = None
+        self.blacklist_clears = 0
+        self.retry_timer = None
 
         # Stop sign state (Task 4.1)
         self.paused = False
-        self.saved_goal = None
+        self.deferred_result = None     # navigator result that arrived during a pause
         self.last_resume_time = None
         self.pause_timer = None
-        self.hold_timer = None
 
         # ---------------- ROS interfaces ----------------
         self.cmd_nav_pub = self.create_publisher(TurtleBotState, "/cmd_nav", 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.create_subscription(TurtleBotState, "/state", self.state_callback, 10)
         self.create_subscription(OccupancyGrid, "/map", self.map_callback, 10)
         self.create_subscription(Bool, "/nav_success", self.nav_success_callback, 10)
@@ -83,7 +80,7 @@ class FrontierExplorer(Node):
             resolution=msg.info.resolution,
             size_xy=np.array([msg.info.width, msg.info.height]),
             origin_xy=np.array([msg.info.origin.position.x, msg.info.origin.position.y]),
-            window_size=9,
+            window_size=5,
             probs=msg.data,
         )
 
@@ -98,24 +95,46 @@ class FrontierExplorer(Node):
         self.send_next_goal()
 
     def nav_success_callback(self, msg: Bool):
-        # Ignore navigator results while we are paused at a stop sign.
+        # While paused, remember the result and handle it after the pause.
         if self.paused:
+            self.deferred_result = msg
             return
         if not self.started or self.finished:
             return
 
         if msg.data:
             self.get_logger().info("Reached frontier goal.")
-        else:
-            # Planning failed: remember this goal so we don't pick it again.
-            if self.current_goal is not None:
-                self.failed_goals.append(self.current_goal.copy())
-                self.get_logger().warn(
-                    f"Planning failed for ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}), "
-                    f"blacklisting it ({len(self.failed_goals)} total)."
-                )
+            self.blacklist_clears = 0
+            self.send_next_goal()
+            return
 
-        self.send_next_goal()
+        # Planning failed: remember this goal so we don't pick it again, then wait
+        # a moment (map and robot pose change) instead of instantly trying the next one.
+        if self.current_goal is not None:
+            self.failed_goals.append(self.current_goal.copy())
+            self.get_logger().warn(
+                f"Planning failed for ({self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}), "
+                f"blacklisting it ({len(self.failed_goals)} total)."
+            )
+        self.schedule_retry(float(self.get_parameter("retry_delay").value))
+
+    def schedule_retry(self, delay):
+        """Call send_next_goal once after `delay` seconds (at most one pending)."""
+        if self.retry_timer is not None:
+            return
+
+        def _retry():
+            self.retry_timer.cancel()
+            self.destroy_timer(self.retry_timer)
+            self.retry_timer = None
+            if self.finished:
+                return
+            if self.paused:
+                self.schedule_retry(1.0)     # try again after the stop sign pause
+                return
+            self.send_next_goal()
+
+        self.retry_timer = self.create_timer(delay, _retry)
 
     # ================================================================== #
     # Stop sign handling (Task 4.1)
@@ -133,43 +152,27 @@ class FrontierExplorer(Node):
 
         duration = float(self.get_parameter("stop_duration").value)
         self.paused = True
-        self.saved_goal = None if self.current_goal is None else self.current_goal.copy()
-        self.get_logger().info(f"Stop sign detected: stopping for {duration:.0f} s.")
-
-        # Keep commanding zero velocity while paused, and resume after `duration`.
-        self.hold_timer = self.create_timer(0.05, self.hold_still)
+        self.deferred_result = None
+        self.get_logger().info(f"Stop sign detected: pausing exploration for {duration:.0f} s.")
         self.pause_timer = self.create_timer(duration, self.resume)
 
-    def hold_still(self):
-        self.cmd_vel_pub.publish(Twist())   # all zeros
-
     def resume(self):
-        # The pause timer is periodic, so cancel it (and the hold timer) here.
-        for t in (self.pause_timer, self.hold_timer):
-            if t is not None:
-                t.cancel()
-                self.destroy_timer(t)
-        self.pause_timer = None
-        self.hold_timer = None
+        # The timer is periodic, so cancel it here to make it one-shot.
+        if self.pause_timer is not None:
+            self.pause_timer.cancel()
+            self.destroy_timer(self.pause_timer)
+            self.pause_timer = None
 
         self.paused = False
         self.last_resume_time = self.get_clock().now()
         self.get_logger().info("Resuming exploration.")
 
-        # Continue to the goal we were driving to, unless we are already there.
-        if self.saved_goal is not None and self.state is not None:
-            current_xy = np.array([self.state.x, self.state.y])
-            min_dist = float(self.get_parameter("min_goal_dist").value)
-            if np.linalg.norm(self.saved_goal - current_xy) > min_dist:
-                goal = TurtleBotState()
-                goal.x = float(self.saved_goal[0])
-                goal.y = float(self.saved_goal[1])
-                goal.theta = float(np.arctan2(self.saved_goal[1] - current_xy[1],
-                                              self.saved_goal[0] - current_xy[0]))
-                self.current_goal = self.saved_goal
-                self.cmd_nav_pub.publish(goal)
-                return
-        self.send_next_goal()
+        # The navigator keeps driving to its current goal on its own. Only step in
+        # if it finished (or failed) a goal while we were paused.
+        if self.deferred_result is not None:
+            msg = self.deferred_result
+            self.deferred_result = None
+            self.nav_success_callback(msg)
 
     # ================================================================== #
     # Exploration logic (ported from HW4 Problem 2)
@@ -230,15 +233,32 @@ class FrontierExplorer(Node):
         return frontier_states[keep]
 
     def send_next_goal(self):
-        if self.occupancy is None or self.state is None:
+        if self.occupancy is None or self.state is None or self.finished:
             return
 
         current_xy = np.array([self.state.x, self.state.y])
 
-        frontier_states = self.explore()
-        frontier_states = self.filter_frontiers(frontier_states, current_xy)
+        raw_frontiers = self.explore()
+        frontier_states = self.filter_frontiers(raw_frontiers, current_xy)
+        self.get_logger().info(
+            f"Frontiers: {len(raw_frontiers)} found, {len(frontier_states)} usable, "
+            f"{len(self.failed_goals)} blacklisted goals."
+        )
 
         if len(frontier_states) == 0:
+            max_clears = int(self.get_parameter("max_blacklist_clears").value)
+            if self.blacklist_clears < max_clears:
+                # Nothing usable right now. The map may still be growing, or goals may
+                # have been blacklisted after a failed plan. Forget the blacklist and
+                # look again shortly instead of ending the run.
+                self.blacklist_clears += 1
+                self.failed_goals = []
+                self.get_logger().warn(
+                    f"No usable frontiers ({len(raw_frontiers)} found). Re-checking in 3 s "
+                    f"({self.blacklist_clears}/{max_clears})."
+                )
+                self.schedule_retry(3.0)
+                return
             self.finished = True
             self.current_goal = None
             self.get_logger().info("Finished exploring")
